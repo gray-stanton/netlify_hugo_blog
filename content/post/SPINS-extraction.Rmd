@@ -1,0 +1,123 @@
+---
+title: "Ingredient Tagging"
+author: "Gray"
+date: "November 3, 2016"
+output: 
+  html_document:
+    theme: simplex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r libraries_real, include = FALSE}
+library(assertthat)
+library(dplyr)
+library(tidyr)
+```
+### Setup
+```{r libraries_fake, eval = FALSE}
+library(assertthat)
+library(dplyr)
+library(tidyr)
+```
+
+```{r category_name, echo=TRUE}
+category_name <- "Popcorn"
+db_file_name <- paste(category_name, "tagging_download.csv", sep = "_")
+db_file_name
+```
+##Preprocessing Panels
+#### Loading Ingredient Panels
+As the analyst was tagging products in the tagging app, they also were collecting ingredient panels by pasting or transcribing the ingredient panel into the correct box in the app. Now that you have downloaded the datafile from the server, we are able to begin tagging these ingredient panels.  
+
+The downloaded datafile must be in your working directory:
+
+```{r file, echo = TRUE}
+getwd()
+assert_that(is.readable(db_file_name)) #uses assertthat
+```
+
+Now, we can read the file and extract the ingredient panel text. The downloaded database file should have these three columns: Product_Name, UPC, and Panel. If the UPC was tagged, but the ingredient panel could not be found, then the Panel text box in the tagging app should have "NA" entered.
+```{r load, echo = TRUE}
+db_file <- read.csv(db_file_name, stringsAsFactors = FALSE, na = c("NA", ""))
+ingredient_data <- db_file[,c("Product_Name", "UPC", "Panel")]
+```
+
+#### Cleaning and Unnesting
+Now that each UPC has an ingredient panel associated with it, we wish to extract each ingredient element from the panel. An  ingredient element is defined as the word or series of words in the ingredient panel that indicate a single ingredient in the product. For example: Aningredient panel for a kettle corn product might be *"Organic Non-GMO Corn, Sugar, Sea Salt, Citric Acid {Organic} "*. Then, the panel would be decomposed into ingredient elements *"Organic Non-GMO Corn"*, *"Sugar"*, *"Sea Salt"*, and *"Citric Acid Organic"*. In this instance, the ingredient elements are comma separated, but in general they might be separated by other delimiters.  
+
+Additionally, there is often a good deal of noise in these panels, in the form of non-separating and non-signifying characters, such as "&" or "*", which should be removed.  
+
+Our cleaning function removes punctuation characters, except for splitting punctuation characters defined as the set `",;():|"` , and then maps the ingredient to lowercase.   
+```{r clean_func, echo = TRUE}
+clean <- function (s) {
+  s <- gsub("(?![][,;():|])[[:punct:]]", "", s, perl = TRUE) #Matchs and removes any punctuation character except for "][,;():|"
+  s <- tolower(s)
+  return(s)
+}
+```
+
+Next, we apply this cleaning function, which leaves only the splitting punctuation behind, and then we split full ingredient panel strings into seperate ingredient elements based on the remaining punctuation.  
+```{r apply_clean, echo = TRUE}
+ingredient_data$Panel <- clean(ingredient_data$Panel)
+ingredient_data <- ingredient_data %>% mutate(Element_List = strsplit(Panel, split = "[][,;():|]", perl = TRUE)) #Uses dplyr
+```
+  
+Now, for each UPC we have a list of ingredient elements associated with it. We are still in a *wide* format, as each UPC appears only once. To continue our analysis, it is necessary to put this data in a *long* format, with each UPC-Element pair having its own row.  
+
+```{r make_long, echo = TRUE}
+ingredient_long <- ingredient_data %>% unnest(Element_List) # unnest uses tidyr, takes a list column and gives each element its own row.
+ingredient_long <- rename(ingredient_long, Element = Element_List) #uses dplyr
+ingredient_long <- ingredient_long[grepl("[:alpha:]", ingredient_long$Element),c("UPC", "Element")] #remove all edge cases where no letter is in the element string
+```
+#### Text Correction  
+We also should correct for a few irregulatities in the text strings: first that there might leading or trailing whitespace and second that there might be tabs or double spaces in the text.
+```{r rm_whitespace, echo=TRUE}
+ingredient_long$Element <- trimws(ingredient_long$Element)
+ingredient_long$Element <- gsub("[[:space:]]", " ", ingredient_long$Element, perl = TRUE) #Matches all whitespace and replaces with 1 space
+ingredient_long$Element <- gsub("[ ]{2,}", " ", ingredient_long$Element, perl = TRUE) #replaces multiple spaces with 1
+ingredient_long <- ingredient_long %>% select(UPC, Element)
+head(ingredient_long)
+```
+Assuming that all looks as it should be, we will write this long file to a CSV, so that an analyst can go through the process of creating ingredient attributes and assigning ingredient elements to them.
+```{r write_ingr}
+ingredient_long_filename <- paste(category_name, "ingredients.csv", sep = "_")
+write.csv(ingredient_long, ingredient_long_filename, row.names = FALSE)
+```
+##Text Mining
+The text mining process may need revision, so that it has a clear set of goals and outputs.
+
+
+##Attribute Tagging
+####Creation
+By taking into account the output of the text mining, the analyst and the lead should follow a hypothesis-driven approach of which ingredient and ingredient groups are most likely to be relevant to the category. This discussion should lead to a series of ingredient attributes, such as LemonOrLime or PotatoProduct, whose presence or absence in product's ingredient panel will be tagged for.
+
+Once this list of ingredient attributes is created, the analyst should examine the file containing UPC-Ingredient Element pairs: **`r ingredient_long_filename`**, to decide which ingredient elements should count as signifying the ingredient attribute. A CSV file with the name **`r paste(category_name, "ingredient_attributes.csv", sep = "_")`** should be created, with the first row being the names of the ingredient attributes, and the column beneath them filled in with the ingredient element strings extracted from **`r ingredient_long_filename`**.
+
+####Loading and tagging
+```{r load_ingrattrs, echo = TRUE}
+ingredient_attribute_filename <- paste(category_name, "ingredient_attributes.csv", sep = "_")
+assert_that(is.readable(ingredient_attribute_filename))
+ingredient_attributes <- read.csv(ingredient_attribute_filename, na = "", stringsAsFactors = FALSE)
+```
+Because each attribute is composed of a varying number of element strings, it makes more sense to represent the data as a list, with each attribute corresponding to a vector of element strings:
+```{r make_list, echo = TRUE}
+attribute_list <- as.list(ingredient_attributes)
+attribute_list <- lapply(X = attribute_list, FUN = function (vs) vs[!is.na(vs)])
+```
+Once this is complete, we are ready to tag the ingredient attributes. First, we will create a function that takes a vector of element strings and produces a vector of tags .
+```{r ingredient_tagging, echo = TRUE}
+tag_UPCs <- function(element_strings){
+  vapply(X = unique(ingredient_long$UPC), 
+         #For each UPC, if any of the elements associated with it are in the vector of target strings, return 1, else 0
+         FUN = function (u) {ifelse(any(ingredient_long[ingredient_long$UPC == u, "Element"] %in% element_strings), 1, 0)},
+         FUN.VALUE = 0)
+}
+ingredient_tags <- lapply(X = attribute_list, FUN = tag_UPCs)
+ingredient_tags <- cbind(UPC = unique(ingredient_long$UPC), as.data.frame(ingredient_tags), stringsAsFactors = FALSE)
+row.names(ingredient_tags) <- NULL #to avoid info duplication
+head(ingredient_tags)
+```
+
+Great! Assuming everything is as it should be, we now have ingredient tags! The analyst should be sure to perform some spot checks: choose a UPC that recieves a `1` in some attribute, and cross-check that at least one ingredient element in the ingredient attribute matches an ingredient element in the ingredient panel for that UPC.
